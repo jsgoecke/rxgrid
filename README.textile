@@ -1,0 +1,11 @@
+h1. rxgrid
+
+h2. Description
+
+Ruby library for publishing OSX Xgrid jobs.
+
+h2. Author
+
+h3. Original Website
+
+<a href='http://www.tslab.se.shibaura-it.ac.jp/index.php/Software/rxgrid'>rxgrid @ www.tslab.se.shibaura-it.ac.jp</a>

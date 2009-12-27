@@ -1,0 +1,20 @@
+1. The following submits a job defined in a batch file 'bc.rb' and 
+   creates a file 'bc_map.csv'.
+   % rxgrid -job batch bc.rb
+
+   The following retrieves the result.
+   % rxgrid -job results -map bc_map.csv
+
+2. The following submits jobs defined in a batch file 'bc_dep.rb'.
+   The batch file refers to the file 'bc_map.csv'.
+   % rxgrid -job batch bc_dep.rb
+
+   The following retrieve their results.
+   % rxgrid -job results -map bc_dep_map.csv
+
+3. The following submits a job defined in a batch file 'bc_file.rb'.
+   Tasks of the job are dynamically determined at the submission.
+   % rxgrid -job batch bc_file.rb
+
+   The following retrieves the result.
+   % rxgrid -job results -map bc_file_map.csv

@@ -1,0 +1,53 @@
+ History of rxgrid
+
+    2008/11/29: Version 0.95 is released.
+              : Bug fix for obtaining job id.
+    2008/ 9/ 3: Version 0.94 is released.
+              : Bug fix for the keyword 'contents' of 'file'.
+    2007/ 9/25: Version 0.93 is released.
+              : The syntax has become simplified. Parameters for blocks and '=' are not needed.
+                The old syntax is still accepted for backward compatibility.
+              : Manipulation of previously submitted jobs in submission is fixed.
+    2007/ 8/17: Version 0.92 is released.
+              : The property name 'taskMustStartSimultaneously' of jobs has changed to 'tasksMustStartSimultaneously'.
+                The old name is still accepted for backward compatibility.
+              : Typographic errors of variable names in the global method 'check' have been fixed.
+                (Both 'unusedTask' and 'unusedTaskNames' have been changed to 'unusedTasks'.)
+              : Typographic errors of '-job specification" have been fixed.
+                (The option 'specfication' have been changed to 'specification'.)
+              : The '-id' option for '-job stop|suspend|resume|delete|specification|restart' has become optional.
+    2007/ 5/ 4: Version 0.91 is released.
+              : Help message has been fixed.
+    2007/ 5/ 1: Redundant comments have been removed.
+              : A redundant golobal variable '$rxgridFileNameCounter' has been removed.
+    2007/ 4/30: A new option '-version' is added.
+    2007/ 4/29: Commands specified by relative paths have been supported.
+              : Help message has been fixed.
+              : The prefix of global variables '$rgrid' has changed to '$rxgrid'.
+              : The prefix of temporary files 'rgrid_batch' has changed to 'rxgrid_batch'.
+    2007/ 3/ 5: Redundant local semantic check in Job has been fixed.
+              : The method name 'collectFiles' has changed to 'collectInputFiles'.
+    2007/ 2/23: Help message has been fixed.
+    2007/ 2/21: Version 0.90 is released under GPL ver.2.
+              :The 'doAttributes' method has been added.
+              : The method 'jobId' has moved from 'Job' class to the top level.
+              : CSV module has not been needed for the jobId method of Job class.
+              : The '-id' option for '-job attributes' and '-job results' has become optional.
+    2007/ 2/20: The environment variable 'RGRID_XGRID' has changed to 'RXGRID_XGRID'.
+              : The name of this program 'rxgrid.rb' has changed to 'rxgrid'.
+    2007/ 2/19: The name of this program 'rgrid.rb' has changed to 'rxgrid.rb'.
+    2007/ 2/15: Entity references in the resulting batch files have been supported.
+    2007/ 2/14: The method 'inputFileMap' has been added to Task class.
+              : A wrong output in a method 'to_xml' of InputFile has been corrected.
+              : Substrings 'Executed', 'Execution' and 'Execute' in identifiers and messages are
+              : replaced with 'Submitted', 'Submission' and 'Submit' respectively.
+              : Variable names 'agentFileName' and 'localFileName' are replaced with 
+                'agentPathName' and 'localPathName' respectively.
+    2007/ 2/ 9: The method 'jobId' has been added to Job class.
+              : A wrong variable name in 'refersTo' method of 'Task' class has been corrected.
+              : Redundant substitutions in classes 'InputFile', 'Task' and 'Job' have been removed.
+              : The default value of 'taskMustStartSimultaneously' has changed to 'true'.
+    2007/ 1/28: A debug message has been removed.
+    2007/ 1/ 7: Basic functions have been implemented.
+    2006/12/27: I started writing this program as my first Ruby program.
+ 

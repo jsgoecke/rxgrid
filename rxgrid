@@ -1,0 +1,1459 @@
+#!/usr/bin/ruby
+# -*- coding: cp932 -*-
+#
+# A processor for RuBLX (a Ruby-based Batch Language for Xgrid)
+# 
+# Version:
+#
+#    0.95
+#
+# Author: 
+#
+#    Tetsuya SUZUKI
+#
+#    Department of Electronic Information Systems
+#    Shibaura Institute of Technology
+#
+# Web site:
+#
+#    http://www.tslab.se.shibaura-it.ac.jp/software/rxgrid
+#
+# Bug reports:
+#
+#    Bug reports and feedback can be sent to the following mail address. 
+#    tetsuya[at]sic.shibaura-it.ac.jp    (Please replace '[at]' with '@')
+#
+# Usage:
+#
+#    rxgrid [-h[ostname] hostname] [-auth { Password | Kerberos }]
+#           [-p[assword] password] [-xgrid xgrid-command]
+#    rxgrid [-nosubmission] [-createbatchfiles] -job batch [-gid grid-identifier] [-map mapfile] RuBLX-batch-file
+#    rxgrid -job results [-map mapfile] [-id identifier] [-so stdout] [-se stderr] [-out outdir]
+#    rxgrid -job {stop | suspend | resume | delete | specification | restart}
+#          [-map mapfile] -id identifier
+#    rxgrid -job list [-gid grid-identifier]
+#    rxgrid -job attributes [-map mapfile] [-id identifier]
+#    rxgrid -version
+#    rxgrid -help
+#
+#    The environment variable 'RXGRID_XGRID' can be used instead of the '-xgrid' option.
+# 
+# License 
+#
+#    This program is distributed under the GNU General Public License (GPL) version 2.
+#
+require 'base64'
+require 'tempfile'
+require 'tsort'
+require 'pp'
+
+#
+# Version
+#
+$rxgirdVersion = "0.95"
+
+#
+# Entity Reference class
+#
+class EntityReference
+  def initialize
+    @entityReference = { 
+      /</ => '&lt;',
+      />/ => '&gt;'
+    }
+  end
+
+  def replace(x)
+    result = x
+    @entityReference.each {|key,value|
+      result = result.gsub(key, value)
+    }
+    return result
+  end
+  public :replace
+end
+
+#
+# Hash class with TSort
+# TSort is for cyclic dependecy check among jobs and tasks
+#
+class Hash
+  include TSort
+  alias tsort_each_node each_key
+  def tsort_each_child(node, &block)
+    fetch(node).each(&block)
+  end
+end
+
+#
+# a command used as xgrid
+#
+$OPT_XGRID = ENV['RXGRID_XGRID'] || '/usr/bin/xgrid'
+
+#
+# Table of input files
+# key: String
+# value: InputFile 
+#
+$rxgridInputFiles = {}
+
+#
+# Prefix of dynamiccaly generated file objects
+#
+$rxgridFileNamePrefix = "_RXGRID_RELATIVE_PATH_COMMAD_";
+
+#
+# JobTable class
+# key: String
+# value: Job
+#
+class JobTable < Hash
+  def extractJobs
+    a = []
+    each_value {|j|
+      if Job === j
+        a.push(j)
+      end
+    }
+    return a
+  end
+
+  def extractJobsToBeSubmitted
+    a = []
+    each_value {|j|
+      if Job === j && j.id == nil
+        a.push(j)
+      end
+    }
+    return a
+  end
+
+  def extractPreviouslySubmittedJobs
+    a = []
+    each_value {|j|
+      if Job === j && j.id != nil
+        a.push(j)
+      end
+    }
+    return a
+  end
+
+  def getSubmissionOrder
+    dependency = Hash.new
+    each_value {|j|
+      dependency[j.name] = j.dependsOnJobs
+    }
+    sorted = dependency.tsort
+    selected = sorted.select {|t| self[t].id == nil}
+    return sorted.map {|t| self[t]}
+  end
+end
+
+#
+# Table of Jobs
+#
+$rxgridJobs = JobTable.new
+
+#
+# Table of tasks
+# key: String
+# value: Task
+#
+$rxgridTasks = {}
+
+#
+# error counter
+#
+$rxgridErrors = 0;
+
+#
+# raise an error
+#
+def raiseError (mes) 
+  $rxgridErrors += 1
+  $stderr.puts "Error:" + mes
+end
+
+#
+# warning counter
+#
+$rxgridWarnings = 0
+
+#
+# raise a warning
+#
+def raiseWarning (mes) 
+  $rxgridWarnings += 1
+  $stderr.puts "Warning:" + mes
+end
+
+#
+# InputFile class
+# Its content must be given as either a local file or a string.
+#
+class InputFile 
+  attr_reader :name
+  attr_reader :agentPathName
+  
+  def initialize(name)
+    @name = name # a name in a batch file
+    @agentPathName = nil # a file name on an Xgrid agent
+    @localPathName = nil # a file name on a local machine
+    @contents = nil # a string used as contents
+    @isExecutable = false # true or false(default)
+  end
+  
+  def agentPathName= (string)
+    if (String === string)
+      @agentPathName = string
+    else
+      raiseError("File '#{@name}':The agent file name must be a string.");
+      return
+    end
+  end
+  
+  def localPathName= (string)
+    if (String === string)
+      @localPathName = string
+    else
+      raiseError("File '#{@name}':The local file name must be a string.");      
+      return
+    end
+  end
+  
+  def contents= (string) 
+    if (String === string)
+      @contents = string
+    else
+      raiseError("File '#{@name}':The contents must be a string.");      
+      return
+    end
+  end
+  
+  def isExecutable= (flag) 
+    if (flag) 
+      @isExecutable = true
+    else
+      @isExecutable = false
+    end
+  end
+  
+  # semantic check 
+  def check 
+    if @agentPathName == nil
+      raiseError("File '#{@name}':The agent file name must be specfied.")
+    end
+    if @localPathName == nil && @contents == nil
+      raiseError("File '#{@name}':Either 'localPathName' or 'contents' must be specified.")
+    end
+    if @localPathName != nil && @contents != nil
+      raiseError("File '#{@name}':Both 'localPathName' and 'contents' must not be specified at the same time.")
+    end
+  end
+
+  def getBase64
+    encoded = ""
+    if @localPathName != nil
+      begin
+        io = open(@localPathName, "r")
+        io.binmode
+        encoded = Base64.encode64(io.read)
+        io.close
+      rescue
+        raiseError("File '#{@name}':" + $!.message)
+      end
+    elsif @contents != nil
+      encoded = Base64.encode64(@contents)
+    else
+      raiseError("File '#{@name}':Either a local file name or a content must be specified.")
+    end
+    return encoded
+  end
+  
+  def to_xml 
+    er = EntityReference.new
+    result = "<key>" + er.replace(@agentPathName.to_s) + "</key>\n"
+    result += "<dict>\n"
+    result += "<key>fileData</key>\n"
+    result += "<data>" + getBase64 + "</data>\n"
+    result += "<key>isExecutable</key>\n"
+    if @isExecutable
+      result += "<string>YES</string>\n"
+    else
+      result += "<string>NO</string>\n"
+    end
+    result += "</dict>\n"
+    return result
+  end
+end
+
+#
+# Job@class
+#
+# tags for a job
+# name
+# mail
+# scheduleParameters
+#   tasksMustStartSimultaneously
+#   minimumTaskCount
+#   dependsOnJobs
+# inputFiles
+#   fileData
+#   isExecutable
+# taskPrototypes (not used in this DSL)
+# taskSpecification (generated from task definitions)
+# 
+class Job
+  attr_reader :name
+  attr_reader :tasks
+  attr_reader :dependsOnJobs
+  attr_reader :id
+
+  def initialize(name)
+    @name = name # a name in a batch file
+    @mail = nil # a mail address for notification
+    @tasksMustStartSimultaneously = true # if task must start simultaneously or not
+    @minimumTaskCount = 1
+    @dependsOnJobs = []
+    @files = [] # files this job refers to
+    @tasks = [] # tasks this job has
+    @id = nil # given job id
+    @modified = false # true if at least one of @mail, @tasksMustStartSimultaneously, @minimumTaskCount, @dependsOnJobs, @files, @tasks is modified
+  end
+  
+  def mail= (mail)
+    @modified = true
+    if /.+@.+/ =~ mail
+      @mail = mail
+    else
+      raiseError("Job '#{@name}':Invalid mail address format.")
+    end
+  end
+  
+  # for backward compatibility
+  def taskMustStartSimultaneously= (flag) 
+    @modified = true
+    if flag 
+      @tasksMustStartSimultaneously = true
+    else
+      @tasksMustStartSimultaneously = false
+    end
+  end
+
+  def tasksMustStartSimultaneously= (flag) 
+    @modified = true
+    if flag 
+      @tasksMustStartSimultaneously = true
+    else
+      @tasksMustStartSimultaneously = false
+    end
+  end
+  
+  def minimumTaskCount= (count)
+    @modified = true
+    if Integer === count 
+      if count > 0
+        @minimumTaskCount = count
+      else
+        raiseError("Job '#{@name}':minimumTaskCount must be an integer greater than 0.")
+      end
+    else
+      raiseError("Job '#{@name}':minimumTaskCount must be an integer greater than 0.")
+    end
+  end
+
+  def dependsOnJobs= (jobs) # TODO
+    @modified = true
+    jobs.each {|j|
+      if String === j
+        @dependsOnJobs = @dependsOnJobs | [j]
+      else
+        raiseError("Job '#{@name}':The task name which it depends on must be a string.")
+      end
+    }
+  end
+  
+  def hasSameAgentFileName(file)
+    a = $rxgridInputFiles[file]
+    @files.each {|f|
+      b = $rxgridInputFiles[f]
+      if a != b && a.agentPathName == b.agentPathName
+        return true
+      end
+    }
+    return false
+  end
+
+  def files= (files)
+    @modified = true
+    files.each {|f|
+      addFile(f)
+    }
+  end
+
+  def addFile (file)
+    if String === file
+      if !hasSameAgentFileName(file)
+        @files = @files | [file]
+      else
+        raiseError("Job '#{@name}':A same agent file name '#{file}' is used in the file list.")
+      end
+    else
+      raiseError("Job '#{@name}': Invalid file name is specified in the file list.")
+    end
+  end
+  protected :addFile
+
+  def collectInputFiles ()
+    inputFiles = []
+    @tasks.each { |t|
+      task = $rxgridTasks[t]
+      if task.inputStream != nil
+        inputFiles = inputFiles | [task.inputStream]
+      end
+      task.refersTo.each {|r|
+        inputFiles = inputFiles | [r]
+      }
+      task.inputFileMap.each {|a,f|
+        inputFiles = inputFiles | [f]
+      }
+      if task.hasCommandWithRelativePath
+        inputFiles = inputFiles | [task.relativePathCommandFileName]
+      end
+    }
+    inputFiles = inputFiles | @files
+    return inputFiles
+  end
+
+  def tasks= (tasks)
+    @modified = true
+    tasks.each {|t|
+      addTask(t)
+    }
+  end
+   
+  def addTask (task)
+    if String === task
+      @tasks = @tasks | [task]
+    else
+      raiseError("Job '#{@name}':An invalid task name '#{task}' is specified.")
+    end
+  end
+  protected :addTask  
+
+  def id= (id)
+    if Integer === id && id > 0 || $OPT_NOSUBMISSION
+      @id = id
+    else
+      if Integer === id 
+        puts "#{id}:Integer"
+      elsif String === id
+        puts "#{id}:String"
+      end
+      raiseError("#{@name}:Job ID #{id} must be an integer greater than 0.")
+    end
+  end
+
+  def clearId
+    @id = nil
+  end
+
+  def isPreviouslySubmitted
+    return @id != nil
+  end
+
+  # Local semantic check about this job
+  # 1. Previously submitted job can not have any parameter except id
+  # 2. This job has at leat one task
+  # 3. Local error checks of tasks
+  # 4. Each task this job has is defined
+  # 5. If a task T1 in this job depends on a task T2, T2 must belong to this job
+  # 6. For different input files X and Y in this job, X and Y have different agnet file names.
+  # 7. No cyclic dependency among tasks in this job
+  def check ()
+    # 1
+    if isPreviouslySubmitted
+      if @modified
+        raiseError("#{@name}:A previously submitted job can not have any parameter except id.")
+      end
+      return
+    end
+    # 2
+    if @tasks.size == 0
+      raiseError("Job '#{@name}':No task is specified.")
+    end
+    # 3, 4
+    @tasks.each {|t|
+      if $rxgridTasks[t] != nil
+        $rxgridTasks[t].check
+      else
+        raiseError("Job '#{@name}':It includes an undefined task '#{t}'.")
+      end
+    }
+    # 5
+    @tasks.each {|t|
+      if $rxgridTasks[t] != nil
+        taskT = $rxgridTasks[t]
+        taskT.dependsOn.each {|u|
+          taskU = $rxgridTasks[u]
+          if (@tasks & [u]).size == 0
+            raiseError("Job '#{@name}':A task '#{u}' does not belong to a job '#{name}' though a task '#{t}' in the job depends on the task '#{u}'.")
+          end
+        }
+      end
+    }
+    # 6
+    inputFiles = collectInputFiles()
+    restOfInputFiles = collectInputFiles()
+    inputFiles.each {|a|
+      fileA = $rxgridInputFiles[a]
+      restOfInputFiles = restOfInputFiles - [a]
+      restOfInputFiles.each {|b|
+        fileB = $rxgridInputFiles[b]
+        if fileA != nil && fileB != nil && fileA != fileB && fileA.agentPathName == fileB.agentPathName
+          raiseError("Job '#{@name}':A same agent file name '#{fileA.agentPathName}' is used in the file list.")
+        end
+      }
+    }
+    # 7
+    dependency = {}
+    @tasks.each {|t|
+      if $rxgridTasks[t] != nil
+        dependency[t] = $rxgridTasks[t].dependsOn
+      end
+    }
+    scc = dependency.strongly_connected_components
+    scc.each {|t|
+      if t.size > 1
+        list = t.join(', ')
+        raiseError("Job '#{@name}':There is a cyclic dependency among the follwoing tasks {#{list}}.")
+      end
+    }
+  end
+    
+  def to_xml
+    if isPreviouslySubmitted
+      return ""
+    end
+    er = EntityReference.new
+    result = <<-'EOL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    EOL
+    result += "<dict>\n"
+    result += "<key>name</key>\n"
+    result += "<string>" + er.replace(@name) + "</string>\n"
+    if @mail
+      result += "<key>notificationEmail</key>\n"
+      result += "<string>" + er.replace(@mail) + "</string>\n"
+    end
+    result += "<key>schedulerParameters</key>\n"
+    result += "<dict>\n"
+    result += "<key>tasksMustStartSimultaneously</key>\n"
+    if @tasksMustStartSimultaneously 
+      result += "<string>YES</string>\n"
+    else
+      result += "<string>NO</string>\n"
+    end
+    result += "<key>minimumTaskCount</key>\n"
+    result += "<integer>#{@minimumTaskCount.to_s}</integer>\n"
+    if @dependsOnJobs.size != 0
+      result += "<key>dependsOnJobs</key>\n"
+      result += "<array>\n"
+      @dependsOnJobs.each {|j|
+        k = $rxgridJobs[j]
+        result += "<string>#{k.id}</string>\n"
+      }
+      result += "</array>\n"
+    end
+    result += "</dict>\n"
+
+    inputFiles = collectInputFiles()
+    if inputFiles.size > 0
+      result += "<key>inputFiles</key>\n"
+      result += "<dict>\n"
+      inputFiles.each {|f|
+        result += $rxgridInputFiles[f].to_xml
+      }
+      result += "</dict>\n"
+    end
+    
+    result += "<key>taskSpecifications</key>\n"
+    result += "<dict>\n"
+    @tasks.each { |task|
+      result += $rxgridTasks[task].to_xml
+    }
+    result += "</dict>\n"
+    
+    result += "</dict>\n"
+    result += "</array>\n"
+    result += "</plist>\n"
+    return result
+  end
+end
+
+def jobId (logicalJobId, mapFileName)
+  begin
+    mapFile = open(mapFileName, "r")
+    while line = mapFile.gets
+      line.chomp!
+      if /^(\d+),(.+)$/ =~ line && $2 == logicalJobId
+        return $1.to_i
+      end
+    end
+    mapFile.close
+    raiseError("Job '#{@name}':The logical job id #{logicalJobId} does not exist in the map file #{mapFileName}.")
+  rescue
+    raiseError("Job '#{@name}':#{$!.to_s}.")
+  end
+  return -1;
+end
+
+# Task class
+# 
+# tags for a task
+# command
+# enviroment
+# argument
+# inputStream
+# dependsOn
+# TaskPrototypeIdentifier (not used in this DSL)
+# inputFileMap
+# 
+class Task
+  attr_reader :name
+  attr_reader :command
+  attr_reader :inputStream
+  attr_reader :dependsOn
+  attr_reader :refersTo
+  attr_reader :inputFileMap
+  attr_reader :relativePathCommandFileName
+
+  def initialize(name)
+    @name = name # a name in a batch file
+    @command = nil # a path of a command
+    @environment = {} # environment variables and their values
+    @arguments = [] # arguments for a command (a list of strings)
+    @inputStream = nil # a name of a file used as stdin
+    @dependsOn = [] # task names which this job depends on
+    @refersTo = [] # a list of file names which this task refers to
+    @inputFileMap = {} # map a subset of files in the 'inputFiles' section for this task only
+    @relativePathCommandFileName = nil # A file name of a command with a relative path
+  end
+  
+  def command=(value)
+    # type check
+    if !(String === value) 
+      raiseError("Task '#{@name}':The command name must be a string.");
+      value = ""
+    end
+    @command = value
+    if hasCommandWithRelativePath
+      @relativePathCommandFileName = $rxgridFileNamePrefix + @command
+      if !$rxgridInputFiles[@relativePathCommandFileName]
+        file @relativePathCommandFileName do |t|
+          t.agentPathName = @command
+          t.localPathName = @command
+          t.isExecutable = true
+        end
+      end
+    end
+  end
+
+  def hasCommandWithRelativePath
+    return !(/^\// =~ @command)
+  end
+  
+  def environment= (hash)
+    error = 0;
+    hash.each {|key,value|
+      if !(String === key)
+        error += 1
+      end
+      if !(String === value)
+        error += 1
+      end
+    }
+    if (error > 0)
+      raiseError("Task '#{@name}':Keys and their values for environments must be strings.")
+      return
+    end
+    @environment = hash
+  end
+  
+  def arguments= (args)
+    args.each {|t|
+      if !(String === t)
+        raiseError("Task '#{@name}':Each of the arguments must be a string.")
+      else
+        @arguments.push(t)
+      end
+    }
+  end
+  
+  def inputStream= (stream) 
+    if String === stream
+      @inputStream = stream
+    else
+      raiseError("Task '#{@name}':An invalid input stream '#{stream}' is specified.")
+    end
+  end
+  
+  def dependsOn= (tasks)
+    tasks.each {|t|
+      if String === t
+        @dependsOn = @dependsOn | [t]
+      else
+        raiseError("Task '#{@name}':The task name which it depnends on must be a string.")
+      end
+    }
+  end
+
+  def refersTo= (files)
+    files.each {|t|
+      if String === t
+        @refersTo = @refersTo | [t]
+      else
+        raiseError("Task '#{@name}':It referes to an ivalid file name '#{t}'.")
+      end
+    }
+  end
+
+  def addInputFileMap(key, value)
+    if !(String === key) || !(String === value)
+      raiseError("Task '#{@name}':Keys and their values for inputFileMap must be strings.")
+      return
+    end
+    @inputFileMap[key] = value
+  end
+
+  def inputFileMap= (hash)
+    @inputFileMap = {}
+    error = 0;
+    hash.each {|key,value|
+      if !(String === key) || !(String === value)
+        error += 1
+      else
+        @inputFileMap[key] = value
+      end
+    }
+    if (error > 0)
+      raiseError("Task '#{@name}':Keys and their values for inputFileMap must be strings.")
+      return
+    end
+#    @inputFileMap = hash
+  end
+
+  # Local semantic check about this task
+  # 1. The file specified as input stream is defined
+  # 2. Tasks this task depends on are defined
+  # 3. Files this task refers to are defined
+  # 4. Files in inputFileMap are defined
+  def check
+    # 1
+    @refersTo.each {|f|
+      if ($rxgridInputFiles[f] == nil)
+        raiseError("Task '#{@name}':It refers to an undefined file '#{f}'.")
+      end
+    }
+    # 2
+    @dependsOn.each {|t|
+      if ($rxgridTasks[t] == nil)
+        raiseError("Task '#{@name}':It depends on an undefined task '#{t}'.")
+      end
+    }
+    # 3
+    if (@inputStream != nil && $rxgridInputFiles[@inputStream] == nil)
+      raiseError("Task '#{@name}':It refers to an undefined file '#{@inputStream}' as its input stream.")
+    end
+    # 4
+    @inputFileMap.each {|pathOnAgent, logicalFileName|
+      if ($rxgridInputFiles[logicalFileName] == nil)
+        raiseError("Task '#{@name}':It maps a path on an agent to an undefined file '#{logicalFileName}'.")
+      end
+    }
+  end
+  
+  def to_xml
+    er = EntityReference.new
+    result = "" 
+    result += "<key>" + er.replace(@name) + "</key>\n"
+    result += "<dict>\n"
+    result += "<key>command</key>\n"
+    result += "<string>" + er.replace(@command) + "</string>\n"
+    if @environment.size != 0
+      result += "<key>environment</key>\n"
+      result += "<dict>\n"
+      @environment.each {|key,value|
+        result += "<key>" + er.replace(key) + "</key>"
+        result += "<string>" + er.replace(value) + "</string>"
+      }
+    end
+    if @arguments.size != 0
+      result += "<key>arguments</key>\n"
+      result += "<array>\n"
+      @arguments.each {|t|
+        result += "<string>" + er.replace(t) + "</string>\n"
+      }
+      result += "</array>\n"
+    end
+    if @inputFileMap.size != 0
+      result += "<key>inputFileMap</key>\n"
+      result += "<dict>\n"
+      @inputFileMap.each {|pathOnAgent,logicalFileName|
+        result += "<key>" + er.replace(pathOnAgent) + "</key>\n"
+        f = $rxgridInputFiles[logicalFileName]
+        result += "<string>" + er.replace(f.agentPathName) + "</string>\n"
+      }
+      result += "</dict>\n"
+    end
+    if @inputStream != nil
+      f = $rxgridInputFiles[@inputStream]
+      result += "<key>inputStream</key>\n"
+      result += "<string>" + er.replace(f.name) + "</string>\n"
+    end
+    if @dependsOn.size != 0
+      result += "<key>dependsOnTasks</key>\n"
+      result += "<array>\n"
+      @dependsOn.each {|t|
+        u = $rxgridTasks[t]
+        result += "<string>" + er.replace(u.name) + "</string>"
+      }
+      result += "</array>\n"
+    end
+    result += "</dict>\n"
+    return result
+  end
+end
+
+# Input file definion
+# syntax
+#   file "fileid" do 
+#     ...
+#   end
+# 
+def agentPathName (string)
+  @currentFile.agentPathName = string
+end
+def localPathName (string)
+  @currentFile.localPathName = string
+end
+def contents (string)
+  @currentFile.contents = string
+end
+def isExecutable (flag) 
+  @currentFile.isExecutable = flag
+end
+
+def file (name)
+  # already defined?
+  if $rxgridInputFiles[name] != nil 
+    raiseError("File #{name}:It has been already defined.")
+    return
+  end
+  # registration
+  inputFile = InputFile.new(name)
+  $rxgridInputFiles[name] = inputFile
+
+  # value setting
+  @currentFile = inputFile
+  yield(inputFile)
+  @currentFile = nil
+
+  # semantic check
+  inputFile.check
+end
+
+# Task definition
+# syntax 
+#  task "taskid" do
+#   ...
+#  end
+#  
+def command (value)
+  @currentTask.command = value
+end
+def arguments (args)
+  @currentTask.arguments = args
+end
+def environment (hash)
+  @currentTask.environment = hash
+end
+def inputStream (stream) 
+  @currentTask.inputStream = stream
+end
+def dependsOn (tasks)
+  @currentTask.dependsOn = tasks
+end
+def refersTo (files)
+  @currentTask.refersTo = files
+end
+def inputFileMap (hash)
+  @currentTask.inputFileMap = hash
+end
+
+def task (name) 
+  # already defined?
+  if $rxgridTasks[name] != nil 
+    raiseError("Task #{name}:It has been already defined.")
+    return
+  end
+  # registration
+  task = Task.new(name)
+  $rxgridTasks[name] = task
+
+  # value setting
+  @currentTask = task
+  yield(task)
+  @currentTask = nil
+end
+
+# Job definition
+# syntax 
+#  job "jobid" do
+#   ...
+#  end
+#  
+def mail (mail)
+  @currentJob.mail = mail
+end
+def tasksMustStartSimultaneously (flag)
+  @currentJob.tasksMustStartSimultaneously = flag
+end
+def minimumTaskCount (count)
+  @currentJob.minimumTaskCount = count
+end
+def dependsOnJobs (jobs)
+  @currentJob.dependsOnJobs = jobs
+end
+def files (files)
+  @currentJob.files = files
+end
+def tasks (tasks)
+  @currentJob.tasks = tasks
+end
+def id (id)
+  @currentJob.id = id
+end
+
+def job (name)
+  # already defined?
+  if $rxgridJobs[name]
+    raiseError("Job #{name}:It has been already defined.")
+    return
+  end
+  # registration
+  job = Job.new(name)
+  $rxgridJobs[name] = job
+
+  # value setting
+  @currentJob = job
+  yield(job)
+  @currentJob = nil
+end
+
+# Global semantic check
+# 
+# Error check
+# 1. No job
+# 2. Semantic check for each job
+# 3. Cyclic dependencies among jobs
+# 
+# Warning check
+# 1. Defiend but not used tasks
+# 2. Existence of commands specified by relative paths, which will be copied to agents
+# 3. Defined but not used previously submitted jobs
+# 
+def check
+  # Errors check
+  # 1. 
+  if $rxgridJobs.extractJobsToBeSubmitted.size == 0
+    raiseError("No job is to be submitted.")
+  end
+  # 2.
+  $rxgridJobs.each_value {|j|
+    j.check
+  }
+  # 3.
+  dependency = {}
+  $rxgridJobs.each_value {|j|
+    dependency[j.name] = j.dependsOnJobs
+  }
+  scc = dependency.strongly_connected_components
+  scc.each {|j|
+    if j.size > 1
+      list = j.join(', ')
+      raiseError("There is a cyclic dependency among the follwoing jobs {#{list}}.")
+    end
+  }
+
+  # Warnings to be checked
+  # 1. 
+  unusedTasks = $rxgridTasks.keys
+  $rxgridJobs.extractJobsToBeSubmitted.each {|j|
+    unusedTasks = unusedTasks - j.tasks
+  }
+  if unusedTasks.size != 0
+    if unusedTasks.size == 1
+      raiseWarning("The following task is defined but not used:" + unusedTasks.join(', '))
+    else
+      raiseWarning("The following tasks are defined but not used:" + unusedTasks.join(', '))
+    end
+  end
+  # 2. 
+  $rxgridJobs.extractJobsToBeSubmitted.each {|j|
+    j.tasks.each {|u|
+      t = $rxgridTasks[u]
+      if !(/^\// =~ t.command) && !FileTest.exist?(t.command)
+        raiseWarning("#{t.name}:The command specified by a relative path '#{t.command}' does not exist.")
+      end
+    }
+  }
+  # 3. 
+  dependedJobs = []
+  $rxgridJobs.extractJobsToBeSubmitted.each {|j|
+    j.dependsOnJobs.each {|k|
+      dependedJobs = dependedJobs | [k]
+    }
+  } 
+  $rxgridJobs.extractPreviouslySubmittedJobs.each {|psj|
+    if (dependedJobs & [psj.name]).size == 0
+      raiseWarning("Job '#{psj.name}': The previously submitted job is defined but not used.")
+    end
+  }
+end
+
+
+def doBatch
+  submittedJobsList = []
+  batchDirName, batchBaseName = File.split(File.basename($rxgridFileName, ".*"))
+  mapFileName =  $OPT_MAP || batchBaseName + "_map.csv"
+
+  $rxgridJobs.getSubmissionOrder.each { |j|
+    puts "Dealing with " + j.name
+
+    if j.isPreviouslySubmitted
+      next;
+    end
+
+    # create a batch file as a local file
+    batchFileName = "" # a file name will be set at the next if-statement
+    bacth = ""         # a File object will be set at the next if-statement 
+    if $OPT_CREATEBATCHFILES
+      batchFileName = batchBaseName + "_#{j.name}.plist"
+      batch = File.open(batchFileName, "w")
+    else
+      batch = Tempfile::new("rxgrid_batch")
+      batchFileName = batch.path
+    end
+    batch.puts j.to_xml 
+#    puts j.to_xml
+    batch.flush
+    
+    # submission
+    if $OPT_NOSUBMISSION
+      # behave as if the job is submittied
+      j.id = '#{' + j.name + '_id}' # set job id
+      submittedJobsList.push(j)
+    else
+      # really submit the job to Xgrid
+      cmd = "#{$OPT_XGRID} #{constructBasicOption} -job batch #{batchFileName}"
+#      $stderr.puts cmd
+      xgrid = IO.popen(cmd)
+      xgrid.sync = true
+#      j.id = nil
+      while line = xgrid.gets
+        line.chomp!
+        if /jobIdentifier\s+=\s+(\d+);/ =~ line
+          j.id = $1.to_i
+          submittedJobsList.push(j)
+          break
+        end
+      end
+      xgrid.close
+    end
+    
+    batch.close # the tempfile may be deleted at this time. 
+    if !j.id
+      $stderr.puts "Error:Failed to submit the job '#{j.name}'."
+      submittedJobsList.each {|sj|
+        $stderr.puts "Error:The submitted job '#{sj.name}' with id '#{sj.id}' is being deleted."
+        xgrid = IO.popen("#{$OPT_XGRID} -job delete #{sj.id}")
+        xgrid.close
+        sj.clearId
+      }
+      submittedJobsList = []
+      break
+    end
+  }
+  # a list of ids and jobs
+  if !$OPT_NOSUBMISSION && mapFileName
+    mapFile = File.open(mapFileName, "w")
+    submittedJobsList.each {|j|
+     mapFile.puts "#{j.id},#{j.name}"
+    }
+   mapFile.close
+  end
+
+  if !$OPT_NOSUBMISSION
+    submittedJobsList.each {|j|
+      puts "{jobIdentifier = #{j.id}; }"
+    }
+  end
+end
+
+def doResults
+  if !$OPT_ID && !$OPT_MAP
+    $stderr.puts "Error: At least either -id or -map must be specified."
+    exit 1
+  end
+  readMapFile
+  if !$OPT_ID 
+    ids = $rxgridInvertedIdmap.values
+  else
+    ids = [$rxgridInvertedIdmap[$OPT_ID] || $OPT_ID]
+  end
+  ids.each do |id|
+    if !(/\d+/ =~ id)
+      $stderr.puts "Error: id must be an integer:#{id}."
+      exit 1
+    end
+    cmd = "#{$OPT_XGRID} #{constructBasicOption} -job results -id #{id} #{constructSoOption} #{constructSeOption} #{constructOutOption}"
+#    if $rxgridIdmap[id]
+#      print "Results of #{$rxgridIdmap[id]}\n"
+#    else
+#      print "Resulsts of #{id}\n"
+#    end
+#    $stderr.puts cmd # debug
+    xgrid = IO.popen(cmd)
+    xgrid.sync = true
+    while line = xgrid.gets
+      print line
+    end
+    xgrid.close
+  end
+end
+  
+def doList
+  cmd = "#{$OPT_XGRID} #{constructBasicOption} -job list #{constructGidOption}"
+  $stderr.puts cmd
+  xgrid = IO.popen(cmd)
+  xgrid.sync = true
+  while line = xgrid.gets
+    print line
+  end
+  xgrid.close
+end
+
+def doAttributes
+  if !$OPT_ID && !$OPT_MAP
+    $stderr.puts "Error: At least either -id or -map must be specified."
+    exit 1
+  end
+  readMapFile
+  if !$OPT_ID 
+    ids = $rxgridInvertedIdmap.values
+  else
+    ids = [$rxgridInvertedIdmap[$OPT_ID] || $OPT_ID]
+  end
+  ids.each do |id|
+    if !(/\d+/ =~ id)
+      $stderr.puts "Error: id must be an integer:#{id}."
+      exit 1
+    end
+    cmd = "#{$OPT_XGRID} #{constructBasicOption} -job attributes -id #{id}"
+#    if $rxgridIdmap[id]
+#      print "Attributes of #{$rxgridIdmap[id]}\n"
+#    else
+#      print "Attributes of #{id}\n"
+#    end
+#    $stderr.puts cmd # debug
+    xgrid = IO.popen(cmd)
+    xgrid.sync = true
+    while line = xgrid.gets
+      print line
+    end
+    xgrid.close
+  end
+end
+
+def doJobManupulation
+  if !$OPT_ID && !$OPT_MAP
+    $stderr.puts "Error: At least either -id or -map must be specified."
+    exit 1
+  end
+  readMapFile
+  if !$OPT_ID 
+    ids = $rxgridInvertedIdmap.values
+  else
+    ids = [$rxgridInvertedIdmap[$OPT_ID] || $OPT_ID]
+  end
+  ids.each do |id|
+    if !(/\d+/ =~ id)
+      $stderr.puts "Error: id must be an integer:#{id}."
+      exit 1
+    end
+    cmd = "#{$OPT_XGRID} #{constructBasicOption} -job #{$OPT_JOB} -id #{id}"
+    $stderr.puts cmd
+    xgrid = IO.popen(cmd)
+    xgrid.sync = true
+    while line = xgrid.gets
+      print line
+    end
+    xgrid.close
+  end
+end
+
+$OPT_NOSUBMISSION = false # No batch files are submitted to Xgrid
+$OPT_CREATEBATCHFILES = false # batch files will be created as local files
+# OptParser class
+# Command line analyzer
+class OptParser
+  @argi = 0
+  def nextArg 
+    if @argi == ARGV.size
+      return nil
+    end
+    nextArg = ARGV[@argi]
+    @argi += 1
+    return nextArg
+  end
+
+  def parse
+    @argi = 0
+    while arg = nextArg
+       if arg == "-h" || arg == "-hostname"
+        if arg = nextArg
+          $OPT_HOSTNAME = arg
+        else
+          raise "Error:An argument is needed for -h or -hostname"
+        end
+      elsif arg == "-auth"
+        if arg = nextArg
+          $OPT_AUTH = arg
+        else
+          raise "Error:An argument is needed for -auth"
+        end
+      elsif arg == "-p" || arg == "-password"
+        if arg = nextArg
+          $OPT_PASSWORD = arg
+        else
+          raise "Error:An argument is needed for -p or -password"
+        end
+      elsif arg == "-job"
+        if arg = nextArg
+          $OPT_JOB = arg
+        else
+          raise "Error:An argument is needed for -job"
+        end
+      elsif arg == "-gid"
+        if arg = nextArg
+          $OPT_GID = arg
+        else
+          raise "Error:An argument is needed for -gid"
+        end
+      elsif arg == "-id"
+        if arg = nextArg
+          $OPT_ID = arg
+        else
+          raise "Error:An argument is needed for -id"
+        end
+      elsif arg == "-so"
+        if arg = nextArg
+          $OPT_SO = arg
+        else
+          raise "Error:An argument is needed for -so"
+        end
+      elsif arg == "-se"
+        if arg = nextArg
+          $OPT_SE = arg
+        else
+          raise "Error:An argument is needed for -se"
+        end
+      elsif arg == "-out"
+        if arg = nextArg
+          $OPT_OUT = arg
+        else
+          raise "Error:An argument is needed for -out"
+        end
+      elsif arg == "-xgrid"
+        if arg = nextArg
+          $OPT_XGRID = arg
+        else
+          raise "Error:An argument is needed for -xgrid"
+        end
+      elsif arg == "-map"
+        if arg = nextArg
+          $OPT_MAP = arg
+        else
+          raise "Error:An argument is needed for -map"
+        end
+#      elsif arg == "-grid"
+#        if arg = nextArg
+#          $OPT_GRID = arg
+#        else
+#          raise "Error:An argument is needed for -grid"
+#        end
+      elsif arg == "-nosubmission"
+        $OPT_NOSUBMISSION = true
+      elsif arg == "-createbatchfiles"
+        $OPT_CREATEBATCHFILES = true
+      elsif arg == "-help"
+        $OPT_HELP = true
+      elsif arg == "-version"
+        $OPT_VERSION = true
+      else
+        $OPT_NONOPT = arg
+      end
+    end
+    return nil
+  end
+end
+
+def constructBasicOption 
+  opt = ""
+  if $OPT_HOSTNAME
+    opt += " -h #{$OPT_HOSTNAME}"
+  end
+  if $OPT_AUTH
+    opt += " -auth #{$OPT_AUTH}"
+  end
+  if $OPT_PASSWORD
+    opt += " -p #{$OPT_PASSWORD}"
+  end
+  return opt
+end
+
+def constructGidOption
+  opt = ""
+  if $OPT_GID
+    opt += " -gid #{$OPT_GID}"
+  end
+  return opt
+end
+
+def constructJobOption
+  opt = ""
+  if $OPT_JOB
+    opt += " -job #{$OPT_JOB}"
+  end
+  return opt
+end
+
+def constructSoOption
+  opt = ""
+  if $OPT_SO
+    opt += " -so #{$OPT_SO}"
+  end
+  return opt
+end
+
+def constructSeOption
+  opt = ""
+  if $OPT_SE
+    opt += " -se #{$OPT_SE}"
+  end
+  return opt
+end
+
+def constructOutOption
+  opt = ""
+  if $OPT_OUT
+    opt += " -out #{$OPT_OUT}"
+  end
+  return opt
+end
+
+def getUsage 
+  usage = <<'EOT'
+rxgrid [-h[ostname] hostname] [-auth { Password | Kerberos }]
+      [-p[assword] password] [-xgrid xgrid-command]
+rxgrid [-nosubmission] [-createbatchfiles] -job batch [-gid grid-identifier] [-map mapfile] rxgrid-batch-file
+rxgrid -job results [-map mapfile] [-id identifier] [-so stdout] [-se stderr] [-out outdir]
+rxgrid -job {stop | suspend | resume | delete | specification | restart}
+      [-map mapfile] [-id identifier]
+rxgrid -job list [-gid grid-identifier]
+rxgrid -job attributes [-map mapfile] [-id identifier]
+rxgrid -version
+rxgrid -help
+EOT
+#rxgrid -grid list
+#rxgrid -grid attributes -gid identifier
+  return usage
+end
+
+# key: an id
+# value: a job name
+$rxgridIdmap = {}
+
+# key: a job name
+# value: an id
+$rxgridInvertedIdmap = {}
+
+# read a map file
+def readMapFile
+  if $OPT_MAP
+    mapFile = open($OPT_MAP, "r")
+    while line = mapFile.gets
+      line.chomp!
+      if /^(\d+),(.+)$/ =~ line
+        $rxgridIdmap[$1] = $2
+        $rxgridInvertedIdmap[$2] = $1
+      end
+    end
+    mapFile.close
+  end
+end
+
+parser = OptParser.new
+begin
+  parser.parse
+rescue
+  $stderr.puts $!.message
+  $stderr.puts "use -help option to print usage"
+  exit 1
+end
+
+if $OPT_HELP
+  puts getUsage
+  exit 0
+end
+
+if $OPT_VERSION
+  puts "rxgrid" + " version " + $rxgirdVersion
+  exit 0
+end
+
+if !$OPT_JOB 
+  $stderr.puts "Error:-job option is needed."
+  $stderr.puts "use -help option to print usage"
+  exit 1
+end
+
+if /batch/ =~ $OPT_JOB
+  # evaluate definitions of jobs and tasks
+  $rxgridFileName = File.expand_path($OPT_NONOPT)
+  rgridFile = open($rxgridFileName, "r")
+  eval rgridFile.readlines.join()
+  rgridFile.close
+  # semantic check
+  check
+  # submit jobs
+  if ($rxgridErrors == 0)
+    doBatch
+  end
+elsif /results/ =~ $OPT_JOB
+  doResults
+elsif /stop|suspend|resume|delete|specification|restart/ =~ $OPT_JOB
+  doJobManupulation
+elsif /list/ =~ $OPT_JOB
+  doList
+elsif /attributes/ =~ $OPT_JOB
+  doAttributes
+else
+  $stderr.puts "Error:Invalid value for -job."  
+  $stderr.puts "use -help option to print usage"
+  exit 1
+end
